@@ -12,3 +12,5 @@ next-env.d.ts
 tsconfig.tsbuildinfo
 .env*
 !.env.example
+pnpm-lock.yaml
+yarn.lock
