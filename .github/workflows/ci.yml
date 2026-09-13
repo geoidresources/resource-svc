@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # No secrets are provided: the build must not need them. Every GCP call is
+      # lazy and every route is dynamic, so a build that starts reading env at
+      # compile time is a regression worth failing on.
+      - name: Build
+        run: npm run build
+
+  secrets:
+    name: No committed secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject tracked env files
+        run: |
+          if git ls-files | grep -E '^\.env($|\.)' | grep -v '^\.env\.example$'; then
+            echo "::error::A .env file is tracked. Remove it and rotate anything it held."
+            exit 1
+          fi
+          echo "no tracked .env files"
+
+      - name: Reject credential material in history
+        run: |
+          if git grep -I -l -e 'BEGIN PRIVATE KEY' -e 'BEGIN RSA PRIVATE KEY' \
+               $(git rev-list --all) -- . ':(exclude).github/workflows/*' > /dev/null 2>&1; then
+            echo "::error::A PEM private key appears in git history."
+            exit 1
+          fi
+          echo "no private keys in history"
