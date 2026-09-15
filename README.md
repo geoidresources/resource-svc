@@ -14,8 +14,8 @@ walking the whole subtree.
 
 | Area | Browse | Download | Upload / new folder |
 |---|---|---|---|
-| `uploads/` | yes | yes | yes |
-| everything else | yes | yes | blocked, server-side |
+| `uploads/` | yes | file or whole folder | yes |
+| everything else | yes | file or whole folder | blocked, server-side |
 
 `tilesets/`, `processed/`, `lidars/` and friends are live pipeline inputs, so writes are
 confined to `UPLOAD_ROOT_PREFIX`. The rule is enforced in `/api/upload/init` and
@@ -65,6 +65,33 @@ Per-file state (session URI + committed offset) is persisted to IndexedDB, and t
 directory handle is stored alongside it. Reopening the app offers to resume: it re-requests
 folder permission, rescans, and continues. On resume each file's true offset is re-read from
 GCS with a `bytes */N` probe rather than trusted from local state.
+
+## Downloading
+
+Bytes come back the same way they go out: the function signs, the browser transfers.
+
+A single object is a signed read URL handed to the browser's own download manager, so it
+survives the tab closing. A folder is a different problem — `COJAGField/` alone is 3 GB
+across 224 objects — and gets a recursive listing (`/api/download/manifest`) plus read URLs
+minted 100 at a time, just ahead of each transfer, so a multi-hour run never holds a URL
+long enough for its signature to age out.
+
+There are two destinations, offered once the folder has been sized:
+
+| | Destination | Parallel | Pause / retry |
+|---|---|---|---|
+| Chrome, Edge | a folder picked on disk, tree preserved | 4 files | yes |
+| any browser | one `.zip` | 1 file | no |
+
+Saving into a folder is the one that scales: nothing is staged anywhere, and files already
+present at the same size are skipped, so pointing at the same folder again resumes an
+interrupted download instead of refetching tens of GB.
+
+The zip is built by `src/download/zip.ts` — stored, never deflated, because laz, png and
+jpeg are already compressed — and streams out entry by entry as the bytes arrive rather
+than being assembled in memory. ZIP64 records kick in past 4 GiB or 65535 entries. Because
+an archive is only valid once its central directory is written, that path cannot be paused
+and a cancel discards it.
 
 ## Bucket permissions
 

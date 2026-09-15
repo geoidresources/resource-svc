@@ -14,6 +14,12 @@ declare global {
       mode?: "read" | "readwrite";
       startIn?: string;
     }) => Promise<FileSystemDirectoryHandle>;
+
+    showSaveFilePicker?: (options?: {
+      id?: string;
+      suggestedName?: string;
+      types?: { description?: string; accept: Record<string, string[]> }[];
+    }) => Promise<FileSystemFileHandle>;
   }
 
   interface FileSystemHandle {

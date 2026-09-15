@@ -29,7 +29,7 @@ export function UploadTray({ snapshot, destination, onPause, onResume, onDismiss
   const finished = !snapshot.running && snapshot.doneCount === snapshot.tasks.length;
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 w-[min(28rem,calc(100vw-2rem))] overflow-hidden rounded-xl border bg-card shadow-2xl">
+    <div className="overflow-hidden rounded-xl border bg-card shadow-2xl">
       <div className="flex items-center gap-2 border-b px-4 py-3">
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium">

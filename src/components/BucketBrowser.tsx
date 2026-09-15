@@ -4,8 +4,10 @@ import {
   ChevronRight,
   Download,
   File as FileIcon,
+  FolderDown,
   Folder,
   FolderPlus,
+  HardDriveDownload,
   Link2,
   Lock,
   MoreHorizontal,
@@ -16,6 +18,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
+import { DownloadTray } from "@/components/DownloadTray";
 import { UploadTray } from "@/components/UploadTray";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -44,7 +47,21 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { DownloadEngine } from "@/download/engine";
+import { listFolder, tasksFor } from "@/download/manifest";
+import {
+  blobBytes,
+  DirectorySink,
+  fileStreamBytes,
+  ZipSink,
+  type DownloadSink,
+} from "@/download/sink";
+import type { DownloadSnapshot, RemoteObject } from "@/download/types";
 import { formatBytes, formatWhen } from "@/lib/format";
 import { UploadEngine } from "@/upload/engine";
 import {
@@ -105,8 +122,15 @@ export default function BucketBrowser({ root }: { root: string }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [preparing, setPreparing] = useState<string | null>(null);
   const [canPickDirectory, setCanPickDirectory] = useState(false);
+  const [download, setDownload] = useState<DownloadSnapshot | null>(null);
+  const [downloadTo, setDownloadTo] = useState({ label: "", resumable: true });
+  const [folderTarget, setFolderTarget] = useState<string | null>(null);
+  const [scan, setScan] = useState({ count: 0, bytes: 0, done: false });
 
   const engineRef = useRef<UploadEngine | null>(null);
+  const downloadRef = useRef<DownloadEngine | null>(null);
+  const manifest = useRef<RemoteObject[]>([]);
+  const scanCancelled = useRef(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const dragDepth = useRef(0);
@@ -123,7 +147,8 @@ export default function BucketBrowser({ root }: { root: string }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ prefix: target, pageToken }),
       });
-      if (!res.ok) throw new Error((await res.json()).error ?? `browse ${res.status}`);
+      if (!res.ok)
+        throw new Error((await res.json()).error ?? `browse ${res.status}`);
       const data = (await res.json()) as Listing;
       setListing((prev) =>
         pageToken && prev
@@ -147,15 +172,18 @@ export default function BucketBrowser({ root }: { root: string }) {
   }, [prefix, load]);
 
   useEffect(() => {
-    if (!snapshot?.running) return;
+    if (!snapshot?.running && !download?.running) return;
     const handler = (e: BeforeUnloadEvent) => e.preventDefault();
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
-  }, [snapshot?.running]);
+  }, [snapshot?.running, download?.running]);
 
   const crumbs = useMemo(() => {
     const parts = prefix.split("/").filter(Boolean);
-    return parts.map((name, i) => ({ name, prefix: parts.slice(0, i + 1).join("/") + "/" }));
+    return parts.map((name, i) => ({
+      name,
+      prefix: parts.slice(0, i + 1).join("/") + "/",
+    }));
   }, [prefix]);
 
   const filtered = useMemo(() => {
@@ -204,7 +232,13 @@ export default function BucketBrowser({ root }: { root: string }) {
       }
       // A differing size means the local copy is newer; the service account can
       // overwrite, so this uploads rather than stalling as a conflict.
-      return { relPath: s.relPath, size: s.size, uploaded: 0, status: "pending", attempts: 0 };
+      return {
+        relPath: s.relPath,
+        size: s.size,
+        uploaded: 0,
+        status: "pending",
+        attempts: 0,
+      };
     });
 
     const engine = new UploadEngine(sources, tasks, {
@@ -220,7 +254,10 @@ export default function BucketBrowser({ root }: { root: string }) {
 
   async function pickFolder() {
     try {
-      const handle = await window.showDirectoryPicker!({ id: "geoid-upload", mode: "read" });
+      const handle = await window.showDirectoryPicker!({
+        id: "geoid-upload",
+        mode: "read",
+      });
       setPreparing("Scanning folder…");
       const sources = await scanDirectoryHandle(handle, (n) =>
         setPreparing(`Scanning folder… ${n.toLocaleString()} files`),
@@ -260,13 +297,111 @@ export default function BucketBrowser({ root }: { root: string }) {
       toast.error("Could not create a link");
       return;
     }
-    const { url } = (await res.json()) as { url: string };
+    const { url, expiresInMinutes } = (await res.json()) as {
+      url: string;
+      expiresInMinutes: number;
+    };
     if (disposition === "attachment") {
-      window.location.href = url;
+      // One object goes straight to the browser's own download manager: it survives
+      // this tab closing and needs no write permission to the filesystem.
+      const a = document.createElement("a");
+      a.href = url;
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
     } else {
       await navigator.clipboard.writeText(url);
-      toast.success("Link copied", { description: "Expires in 15 minutes." });
+      toast.success("Link copied", {
+        description: `Expires in ${expiresInMinutes} minutes.`,
+      });
     }
+  }
+
+  async function prepareFolderDownload(target: string) {
+    if (download?.running) {
+      toast.error("A download is already running", {
+        description: "Wait for it to finish, or cancel it first.",
+      });
+      return;
+    }
+    scanCancelled.current = false;
+    manifest.current = [];
+    setScan({ count: 0, bytes: 0, done: false });
+    setFolderTarget(target);
+    try {
+      const found = await listFolder(
+        target,
+        (count, bytes) => setScan({ count, bytes, done: false }),
+        () => scanCancelled.current,
+      );
+      manifest.current = found;
+      setScan({
+        count: found.length,
+        bytes: found.reduce((sum, f) => sum + f.size, 0),
+        done: true,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setFolderTarget(null);
+      toast.error("Could not read that folder", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  async function startFolderDownload(mode: "folder" | "zip") {
+    const target = folderTarget;
+    const items = manifest.current;
+    if (!target || items.length === 0) return;
+    const name = target.split("/").filter(Boolean).pop() ?? "geoid";
+
+    let sink: DownloadSink;
+    try {
+      if (mode === "folder") {
+        const handle = await window.showDirectoryPicker!({
+          id: "geoid-download",
+          mode: "readwrite",
+        });
+        sink = new DirectorySink(handle);
+      } else if (window.showSaveFilePicker) {
+        const handle = await window.showSaveFilePicker({
+          id: "geoid-download-zip",
+          suggestedName: `${name}.zip`,
+          types: [
+            {
+              description: "Zip archive",
+              accept: { "application/zip": [".zip"] },
+            },
+          ],
+        });
+        sink = new ZipSink(
+          `${name}.zip`,
+          fileStreamBytes(await handle.createWritable()),
+        );
+      } else {
+        sink = new ZipSink(`${name}.zip`, blobBytes(`${name}.zip`));
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      toast.error("Could not open that destination", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+
+    setFolderTarget(null);
+    setDownloadTo({ label: sink.label, resumable: sink.resumable });
+    const engine = new DownloadEngine(tasksFor(items), sink, {
+      concurrency: 4,
+      onChange: setDownload,
+      onClosed: (error) => {
+        if (error)
+          toast.error("Could not finish the download", { description: error });
+      },
+    });
+    downloadRef.current = engine;
+    engine.start();
   }
 
   async function createFolder() {
@@ -284,7 +419,9 @@ export default function BucketBrowser({ root }: { root: string }) {
     }
     setNewFolderOpen(false);
     setNewFolderName("");
-    toast.success(data.created ? `Created ${name}/` : `${name}/ already exists`);
+    toast.success(
+      data.created ? `Created ${name}/` : `${name}/ already exists`,
+    );
     void load(prefix);
   }
 
@@ -366,8 +503,22 @@ export default function BucketBrowser({ root }: { root: string }) {
             />
           </div>
 
-          <Button variant="outline" size="icon" onClick={() => void load(prefix)} aria-label="Refresh">
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => void load(prefix)}
+            aria-label="Refresh"
+          >
             <RefreshCw className={loading ? "size-4 animate-spin" : "size-4"} />
+          </Button>
+
+          <Button
+            variant="outline"
+            disabled={!prefix}
+            onClick={() => void prepareFolderDownload(prefix)}
+          >
+            <FolderDown className="size-4" />
+            Download folder
           </Button>
 
           <Button
@@ -402,12 +553,16 @@ export default function BucketBrowser({ root }: { root: string }) {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onSelect={() => fileInputRef.current?.click()}>
+                <DropdownMenuItem
+                  onSelect={() => fileInputRef.current?.click()}
+                >
                   Files…
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onSelect={() =>
-                    canPickDirectory ? void pickFolder() : folderInputRef.current?.click()
+                    canPickDirectory
+                      ? void pickFolder()
+                      : folderInputRef.current?.click()
                   }
                 >
                   Folder…
@@ -423,7 +578,8 @@ export default function BucketBrowser({ root }: { root: string }) {
           multiple
           hidden
           onChange={(e) => {
-            if (e.target.files) void beginUpload(sourcesFromInput(e.target.files));
+            if (e.target.files)
+              void beginUpload(sourcesFromInput(e.target.files));
             e.target.value = "";
           }}
         />
@@ -435,7 +591,8 @@ export default function BucketBrowser({ root }: { root: string }) {
           multiple
           hidden
           onChange={(e) => {
-            if (e.target.files) void beginUpload(sourcesFromInput(e.target.files));
+            if (e.target.files)
+              void beginUpload(sourcesFromInput(e.target.files));
             e.target.value = "";
           }}
         />
@@ -445,8 +602,8 @@ export default function BucketBrowser({ root }: { root: string }) {
             <Lock className="size-4" />
             <AlertTitle>Read-only area</AlertTitle>
             <AlertDescription>
-              This is shared pipeline data. You can browse and download here, but new files can
-              only be written under <code>{root}/</code>.
+              This is shared pipeline data. You can browse and download here,
+              but new files can only be written under <code>{root}/</code>.
             </AlertDescription>
           </Alert>
         )}
@@ -471,7 +628,7 @@ export default function BucketBrowser({ root }: { root: string }) {
                 <TableHead>Name</TableHead>
                 <TableHead className="w-28 text-right">Size</TableHead>
                 <TableHead className="w-32">Modified</TableHead>
-                <TableHead className="w-12" />
+                <TableHead className="w-24" />
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -488,7 +645,10 @@ export default function BucketBrowser({ root }: { root: string }) {
                 <TableRow
                   className="cursor-pointer"
                   onClick={() =>
-                    setPrefix(prefix.split("/").filter(Boolean).slice(0, -1).join("/") + "/")
+                    setPrefix(
+                      prefix.split("/").filter(Boolean).slice(0, -1).join("/") +
+                        "/",
+                    )
                   }
                 >
                   <TableCell colSpan={4} className="text-muted-foreground">
@@ -513,9 +673,23 @@ export default function BucketBrowser({ root }: { root: string }) {
                         {f.name}
                       </span>
                     </TableCell>
-                    <TableCell className="text-right text-muted-foreground">—</TableCell>
+                    <TableCell className="text-right text-muted-foreground">
+                      —
+                    </TableCell>
                     <TableCell className="text-muted-foreground">—</TableCell>
-                    <TableCell />
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        aria-label={`Download ${f.name}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void prepareFolderDownload(f.prefix);
+                        }}
+                      >
+                        <FolderDown className="size-4" />
+                      </Button>
+                    </TableCell>
                   </TableRow>
                 ))}
 
@@ -537,34 +711,61 @@ export default function BucketBrowser({ root }: { root: string }) {
                       {formatWhen(f.updated)}
                     </TableCell>
                     <TableCell>
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button variant="ghost" size="icon" aria-label={`Actions for ${f.name}`}>
-                            <MoreHorizontal className="size-4" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuItem onSelect={() => void openFile(f.key, "attachment")}>
-                            <Download className="size-4" />
-                            Download
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => void openFile(f.key, "inline")}>
-                            <Link2 className="size-4" />
-                            Copy link
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
+                      <div className="flex items-center justify-end">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label={`Download ${f.name}`}
+                          onClick={() => void openFile(f.key, "attachment")}
+                        >
+                          <Download className="size-4" />
+                        </Button>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Actions for ${f.name}`}
+                            >
+                              <MoreHorizontal className="size-4" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              onSelect={() =>
+                                void openFile(f.key, "attachment")
+                              }
+                            >
+                              <Download className="size-4" />
+                              Download
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onSelect={() => void openFile(f.key, "inline")}
+                            >
+                              <Link2 className="size-4" />
+                              Copy link
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
 
-              {!loading && filtered.folders.length === 0 && filtered.files.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={4} className="py-14 text-center text-muted-foreground">
-                    {filter ? "Nothing matches that filter." : "This folder is empty."}
-                  </TableCell>
-                </TableRow>
-              )}
+              {!loading &&
+                filtered.folders.length === 0 &&
+                filtered.files.length === 0 && (
+                  <TableRow>
+                    <TableCell
+                      colSpan={4}
+                      className="py-14 text-center text-muted-foreground"
+                    >
+                      {filter
+                        ? "Nothing matches that filter."
+                        : "This folder is empty."}
+                    </TableCell>
+                  </TableRow>
+                )}
             </TableBody>
           </Table>
         </div>
@@ -595,9 +796,13 @@ export default function BucketBrowser({ root }: { root: string }) {
           <div className="rounded-xl border-2 border-dashed px-10 py-8 text-center">
             <UploadCloud className="mx-auto mb-3 size-9 text-muted-foreground" />
             <p className="font-medium">
-              {readOnly ? "This folder is read-only" : "Drop files or folders to upload"}
+              {readOnly
+                ? "This folder is read-only"
+                : "Drop files or folders to upload"}
             </p>
-            <p className="mt-1 font-mono text-xs text-muted-foreground">{prefix || "Home"}</p>
+            <p className="mt-1 font-mono text-xs text-muted-foreground">
+              {prefix || "Home"}
+            </p>
           </div>
         </div>
       )}
@@ -606,7 +811,9 @@ export default function BucketBrowser({ root }: { root: string }) {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>New folder</DialogTitle>
-            <DialogDescription className="font-mono text-xs">{prefix}</DialogDescription>
+            <DialogDescription className="font-mono text-xs">
+              {prefix}
+            </DialogDescription>
           </DialogHeader>
           <form
             onSubmit={(e) => {
@@ -625,7 +832,11 @@ export default function BucketBrowser({ root }: { root: string }) {
               />
             </div>
             <DialogFooter className="mt-4">
-              <Button type="button" variant="outline" onClick={() => setNewFolderOpen(false)}>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setNewFolderOpen(false)}
+              >
                 Cancel
               </Button>
               <Button type="submit" disabled={!newFolderName.trim()}>
@@ -636,17 +847,137 @@ export default function BucketBrowser({ root }: { root: string }) {
         </DialogContent>
       </Dialog>
 
-      {snapshot && (
-        <UploadTray
-          snapshot={snapshot}
-          destination={prefix}
-          onPause={() => engineRef.current?.pause()}
-          onResume={() => engineRef.current?.start()}
-          onDismiss={() => {
-            setSnapshot(null);
-            void load(prefix);
-          }}
-        />
+      <Dialog
+        open={folderTarget !== null}
+        onOpenChange={(open) => {
+          if (open) return;
+          scanCancelled.current = true;
+          setFolderTarget(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Download folder</DialogTitle>
+            <DialogDescription className="font-mono text-xs">
+              {folderTarget}
+            </DialogDescription>
+          </DialogHeader>
+
+          {!scan.done ? (
+            <p className="text-sm text-muted-foreground">
+              Listing everything underneath…{" "}
+              <span className="tabular-nums">
+                {scan.count.toLocaleString()} files, {formatBytes(scan.bytes)}
+              </span>
+            </p>
+          ) : scan.count === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              This folder holds no files.
+            </p>
+          ) : (
+            <div className="space-y-4">
+              <p className="text-sm">
+                <span className="font-medium tabular-nums">
+                  {scan.count.toLocaleString()} files ·{" "}
+                  {formatBytes(scan.bytes)}
+                </span>{" "}
+                including everything in sub-folders.
+              </p>
+
+              <div className="space-y-2">
+                {canPickDirectory && (
+                  <button
+                    onClick={() => void startFolderDownload("folder")}
+                    className="flex w-full items-start gap-3 rounded-lg border p-3 text-left hover:bg-muted"
+                  >
+                    <HardDriveDownload className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                    <span>
+                      <span className="block text-sm font-medium">
+                        Save into a folder
+                      </span>
+                      <span className="block text-xs text-muted-foreground">
+                        Writes straight to disk, keeping the tree. Pick the same
+                        folder again later and files already there are skipped.
+                      </span>
+                    </span>
+                  </button>
+                )}
+
+                <button
+                  onClick={() => void startFolderDownload("zip")}
+                  className="flex w-full items-start gap-3 rounded-lg border p-3 text-left hover:bg-muted"
+                >
+                  <FolderDown className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                  <span>
+                    <span className="block text-sm font-medium">
+                      Download as one .zip
+                    </span>
+                    <span className="block text-xs text-muted-foreground">
+                      Stored, not compressed, so it is roughly{" "}
+                      {formatBytes(scan.bytes)}. It is built in order and cannot
+                      be paused.
+                    </span>
+                  </span>
+                </button>
+              </div>
+
+              {!canPickDirectory && scan.bytes > 2 * 1024 ** 3 && (
+                <Alert variant="destructive">
+                  <AlertTitle>That is a lot for this browser</AlertTitle>
+                  <AlertDescription>
+                    Without the File System Access API the archive is held by
+                    the browser until it is complete. Chrome or Edge can write
+                    it straight to disk instead.
+                  </AlertDescription>
+                </Alert>
+              )}
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                scanCancelled.current = true;
+                setFolderTarget(null);
+              }}
+            >
+              Cancel
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {(download || snapshot) && (
+        <div className="fixed bottom-4 right-4 z-50 flex w-[min(28rem,calc(100vw-2rem))] flex-col gap-3">
+          {download && (
+            <DownloadTray
+              snapshot={download}
+              destination={downloadTo.label}
+              resumable={downloadTo.resumable}
+              onPause={() => downloadRef.current?.pause()}
+              onResume={() => downloadRef.current?.start()}
+              onCancel={() => {
+                void downloadRef.current?.cancel();
+                setDownload(null);
+              }}
+              onDismiss={() => setDownload(null)}
+            />
+          )}
+
+          {snapshot && (
+            <UploadTray
+              snapshot={snapshot}
+              destination={prefix}
+              onPause={() => engineRef.current?.pause()}
+              onResume={() => engineRef.current?.start()}
+              onDismiss={() => {
+                setSnapshot(null);
+                void load(prefix);
+              }}
+            />
+          )}
+        </div>
       )}
     </div>
   );
